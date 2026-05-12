@@ -524,3 +524,108 @@ class TestExtendedTypeIntegration:
         )
         assert result.num_rows == 1
         assert result["binary"][0].as_py() == b"\x01"
+
+
+# ── timestamp integration tests ──────────────────────────────────────────────
+
+
+def _make_timestamp_table(tmp_path, name, column_tz):
+    """Build a table with a single ``ts`` column of the requested timezone.
+
+    Two rows are inserted: 2024-01-01T00:00:00 and 2024-01-02T00:00:00 in the
+    column's own timezone (or naive if ``column_tz`` is ``None``).
+    """
+    db = lancedb.connect(str(tmp_path))
+    schema = pa.schema([("ts", pa.timestamp("us", tz=column_tz))])
+    if column_tz is None:
+        rows = [datetime(2024, 1, 1, 0, 0, 0), datetime(2024, 1, 2, 0, 0, 0)]
+    else:
+        # Use UTC for the underlying instants regardless of ``column_tz`` so
+        # the table data is deterministic; pyarrow stores timestamps as UTC
+        # epoch microseconds, with ``column_tz`` being metadata only.
+        rows = [
+            datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+            datetime(2024, 1, 2, 0, 0, 0, tzinfo=timezone.utc),
+        ]
+    data = pa.table({"ts": rows}, schema=schema)
+    return db.create_table(name, data, mode="overwrite")
+
+
+class TestTimestampIntegration:
+    """Integration tests for the five timezone-vs-literal interaction modes.
+
+    The lit() implementation in #3235 always emits a naive
+    ``Timestamp(us, None)`` regardless of the input datetime's tzinfo. These
+    tests pin down the resulting behaviour against tz-aware and tz-naive
+    columns.
+    """
+
+    def test_both_naive(self, tmp_path):
+        # column: Timestamp(us, None); literal: naive datetime
+        table = _make_timestamp_table(tmp_path, "ts_both_naive", column_tz=None)
+        cutoff = datetime(2024, 1, 1, 12, 0, 0)
+        result = table.search().where(col("ts") < lit(cutoff)).to_arrow()
+        assert result.num_rows == 1
+        assert result["ts"][0].as_py() == datetime(2024, 1, 1, 0, 0, 0)
+
+    def test_both_same_tz_utc(self, tmp_path):
+        # column: Timestamp(us, "UTC"); literal: tz-aware UTC datetime
+        table = _make_timestamp_table(tmp_path, "ts_same_tz", column_tz="UTC")
+        cutoff = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        result = table.search().where(col("ts") < lit(cutoff)).to_arrow()
+        assert result.num_rows == 1
+        first = result["ts"][0].as_py()
+        assert first == datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_different_tz(self, tmp_path):
+        # column: Timestamp(us, "UTC"); literal: datetime in PST (UTC-8)
+        # 2024-01-01T04:00 PST == 2024-01-01T12:00 UTC, so this should still
+        # split the two rows the same way as the same-tz case.
+        table = _make_timestamp_table(tmp_path, "ts_diff_tz", column_tz="UTC")
+        pst = timezone(timedelta(hours=-8))
+        cutoff = datetime(2024, 1, 1, 4, 0, 0, tzinfo=pst)
+        result = table.search().where(col("ts") < lit(cutoff)).to_arrow()
+        assert result.num_rows == 1
+
+    def test_tz_column_naive_literal(self, tmp_path):
+        # column: Timestamp(us, "UTC"); literal: naive datetime
+        # Naive literal against a tz-aware column is ambiguous; document
+        # whichever way the engine resolves it, but the call must not crash.
+        table = _make_timestamp_table(tmp_path, "ts_tz_naive_lit", column_tz="UTC")
+        cutoff = datetime(2024, 1, 1, 12, 0, 0)
+        result = table.search().where(col("ts") < lit(cutoff)).to_arrow()
+        # Local-time interpretation of the literal could land on either side
+        # of midnight UTC on 2024-01-02 depending on the host timezone, so
+        # only assert the call succeeds and returns a sane row count.
+        assert result.num_rows in (0, 1, 2)
+
+    def test_naive_column_tz_literal(self, tmp_path):
+        # column: Timestamp(us, None); literal: tz-aware datetime
+        table = _make_timestamp_table(tmp_path, "ts_naive_tz_lit", column_tz=None)
+        cutoff = datetime(2024, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        result = table.search().where(col("ts") < lit(cutoff)).to_arrow()
+        assert result.num_rows in (0, 1, 2)
+
+    def test_naive_lit_sql_is_host_independent(self):
+        # Regression test: a naive datetime literal must render to the *same*
+        # SQL string on every machine. The current implementation calls
+        # ``datetime.timestamp()`` on naive values, which Python defines as
+        # "interpret as local time" — so the resulting literal silently
+        # absorbs the host's UTC offset. On a machine in UTC+5:30 (IST), for
+        # example, ``lit(datetime(2024, 1, 1, 12, 0))`` renders to
+        # ``CAST('2024-01-01 06:30:00' AS TIMESTAMP)``, while on a UTC host
+        # the same call would produce ``2024-01-01 12:00:00``. Either we
+        # accept naive datetimes verbatim (recommended), or we reject them.
+        sql = lit(datetime(2024, 1, 1, 12, 0)).to_sql()
+        assert "2024-01-01 12:00:00" in sql, (
+            f"naive datetime literal was shifted by host local tz offset: {sql}"
+        )
+
+    def test_aware_lit_sql_preserves_instant(self):
+        # Two equivalent instants (UTC noon vs PST 4am) must render to the
+        # same SQL — confirms the implementation correctly converts aware
+        # datetimes to a single canonical instant before stripping tz.
+        utc_sql = lit(datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)).to_sql()
+        pst = timezone(timedelta(hours=-8))
+        pst_sql = lit(datetime(2024, 1, 1, 4, 0, tzinfo=pst)).to_sql()
+        assert utc_sql == pst_sql, f"UTC: {utc_sql!r}, PST: {pst_sql!r}"
